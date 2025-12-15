@@ -119,8 +119,17 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
 }
 
-function isFiniteInt(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && Number.isInteger(v);
+function parseIntFromUnknown(v: unknown): number | null {
+  if (typeof v === "number") return Number.isFinite(v) && Number.isInteger(v) ? v : null;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (!s) return null;
+    // allow "10" / "0010" / "-1" style strings; reject floats like "10.5"
+    if (!/^-?\d+$/.test(s)) return null;
+    const n = Number(s);
+    return Number.isFinite(n) && Number.isInteger(n) ? n : null;
+  }
+  return null;
 }
 
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
@@ -261,23 +270,28 @@ export async function POST(req: Request): Promise<Response> {
         { status: 400 }
       );
     }
-    if (!isFiniteInt(body.batch_size) || body.batch_size <= 0) {
-      log("warn", "validation_failed_invalid_batch_size", { batch_size: body.batch_size });
+    const parsedBatchSize = parseIntFromUnknown(body.batch_size);
+    if (parsedBatchSize === null || parsedBatchSize <= 0) {
+      log("warn", "validation_failed_invalid_batch_size", { batch_size_raw: body.batch_size, batch_size_parsed: parsedBatchSize });
       return NextResponse.json(
         { error: "batch_size must be a positive integer.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
         { status: 400 }
       );
     }
-    if (!isFiniteInt(body.batch_start_index) || body.batch_start_index < 0) {
-      log("warn", "validation_failed_invalid_batch_start_index", { batch_start_index: body.batch_start_index });
+    const parsedBatchStartIndex = parseIntFromUnknown(body.batch_start_index);
+    if (parsedBatchStartIndex === null || parsedBatchStartIndex < 0) {
+      log("warn", "validation_failed_invalid_batch_start_index", {
+        batch_start_index_raw: body.batch_start_index,
+        batch_start_index_parsed: parsedBatchStartIndex
+      });
       return NextResponse.json(
         { error: "batch_start_index must be an integer >= 0.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
         { status: 400 }
       );
     }
 
-    const batchSize = body.batch_size;
-    const batchStartIndex = body.batch_start_index;
+    const batchSize = parsedBatchSize;
+    const batchStartIndex = parsedBatchStartIndex;
     const existingPlaceIds = normalizeExistingPlaceIds(body.existing_businesses);
 
     log("info", "validated_request", {
@@ -285,6 +299,8 @@ export async function POST(req: Request): Promise<Response> {
       business_type: body.business_type,
       batch_size: batchSize,
       batch_start_index: batchStartIndex,
+      batch_size_raw: body.batch_size,
+      batch_start_index_raw: body.batch_start_index,
       existing_businesses_dedupe_set_size: existingPlaceIds.size
     });
 
