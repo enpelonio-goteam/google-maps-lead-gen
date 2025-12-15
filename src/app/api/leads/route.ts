@@ -209,6 +209,56 @@ async function serpMapsSearch(params: {
   return { local_results: localResults, nextStart };
 }
 
+async function computeHasNext(params: {
+  apiKey: string;
+  q: string;
+  ll: string;
+  fromIndex: number; // raw serp index to start checking from
+  dedupePlaceIds: Set<string>; // existing + already returned in this response
+  maxLookaheadPages?: number;
+}): Promise<{ hasNext: boolean; pagesChecked: number }> {
+  const maxLookaheadPages = params.maxLookaheadPages ?? 3;
+  const firstPageStart = Math.floor(params.fromIndex / 20) * 20;
+  const offsetWithinPage = params.fromIndex - firstPageStart;
+
+  let start = firstPageStart;
+  let pages = 0;
+  let isFirstPage = true;
+
+  while (pages < maxLookaheadPages) {
+    pages++;
+    const { local_results, nextStart } = await serpMapsSearch({
+      apiKey: params.apiKey,
+      q: params.q,
+      ll: params.ll,
+      start
+    });
+
+    if (!Array.isArray(local_results) || local_results.length === 0) {
+      return { hasNext: false, pagesChecked: pages };
+    }
+
+    const slice = isFirstPage ? local_results.slice(offsetWithinPage) : local_results;
+    isFirstPage = false;
+
+    for (const item of slice) {
+      const pid = typeof item?.place_id === "string" ? item.place_id : "";
+      if (!pid) continue;
+      if (params.dedupePlaceIds.has(pid)) continue;
+      return { hasNext: true, pagesChecked: pages };
+    }
+
+    if (nextStart === null) {
+      return { hasNext: false, pagesChecked: pages };
+    }
+    start = nextStart;
+  }
+
+  // Conservative: if we didn't find a new item within lookahead but pagination continues,
+  // assume there may be more further out.
+  return { hasNext: true, pagesChecked: pages };
+}
+
 export async function POST(req: Request): Promise<Response> {
   const requestId = getRequestId();
   const startedAt = Date.now();
@@ -382,6 +432,24 @@ export async function POST(req: Request): Promise<Response> {
       duration_ms: Date.now() - startedAt
     });
 
+    const newBatchIndex = batchStartIndex + batchSize;
+    const dedupeForNext = new Set<string>(existingPlaceIds);
+    for (const r of collected) {
+      const pid = typeof r?.place_id === "string" ? r.place_id : "";
+      if (pid) dedupeForNext.add(pid);
+    }
+
+    log("info", "has_next_check_begin", { from_index: newBatchIndex });
+    const { hasNext, pagesChecked } = await computeHasNext({
+      apiKey,
+      q: serpQuery,
+      ll,
+      fromIndex: newBatchIndex,
+      dedupePlaceIds: dedupeForNext,
+      maxLookaheadPages: 3
+    });
+    log("info", "has_next_check_done", { has_next: hasNext, pages_checked: pagesChecked });
+
     return NextResponse.json(
       {
         location: body.location,
@@ -389,11 +457,13 @@ export async function POST(req: Request): Promise<Response> {
         ll,
         batch_size: batchSize,
         batch_start_index: batchStartIndex,
-        new_batch_index: batchStartIndex + batchSize,
+        new_batch_index: newBatchIndex,
+        has_next: hasNext,
         results: collected,
         meta: {
           pages_scanned: pages,
-          deduped_against_existing_count: existingPlaceIds.size
+          deduped_against_existing_count: existingPlaceIds.size,
+          has_next_checked_pages: pagesChecked
         }
       },
       { status: 200 }

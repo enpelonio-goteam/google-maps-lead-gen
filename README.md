@@ -50,6 +50,7 @@ Notes:
   "batch_size": 25,
   "batch_start_index": 40,
   "new_batch_index": 65,
+  "has_next": true,
   "results": [
     {
       "place_id": "....",
@@ -58,7 +59,8 @@ Notes:
   ],
   "meta": {
     "pages_scanned": 3,
-    "deduped_against_existing_count": 1
+    "deduped_against_existing_count": 1,
+    "has_next_checked_pages": 2
   }
 }
 ```
