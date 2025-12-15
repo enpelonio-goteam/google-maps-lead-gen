@@ -18,13 +18,12 @@ npm run dev
 
 ### Endpoint
 
-`POST /api/leads`
+`POST /api/leads?api_key=SERPAPI_KEY`
 
 #### Request body
 
 ```json
 {
-  "api_key": "SERPAPI_KEY",
   "location": "Ponsonby, Auckland",
   "business_type": "Property Managers",
   "batch_size": 25,

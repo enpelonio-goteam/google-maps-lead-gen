@@ -56,7 +56,6 @@ type SerpMapsPlace = {
 };
 
 type RequestBody = {
-  api_key: string;
   location: string;
   business_type: string;
   batch_size: number;
@@ -78,10 +77,6 @@ function redactBodyForLogs(body: unknown): unknown {
   const obj = body as Record<string, unknown>;
   const copy: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (k.toLowerCase().includes("api_key") || k.toLowerCase() === "apikey") {
-      copy[k] = "[REDACTED]";
-      continue;
-    }
     if (k === "existing_businesses" && Array.isArray(v)) {
       copy[k] = `[array length=${v.length}]`;
       continue;
@@ -89,6 +84,16 @@ function redactBodyForLogs(body: unknown): unknown {
     copy[k] = v;
   }
   return copy;
+}
+
+function redactUrlForLogs(urlString: string): string {
+  try {
+    const url = new URL(urlString);
+    if (url.searchParams.has("api_key")) url.searchParams.set("api_key", "[REDACTED]");
+    return url.toString();
+  } catch {
+    return urlString;
+  }
 }
 
 function getBodyKeysForDebug(body: unknown): string[] {
@@ -200,6 +205,7 @@ export async function POST(req: Request): Promise<Response> {
   const startedAt = Date.now();
   const vercelId = req.headers.get("x-vercel-id");
   const contentType = req.headers.get("content-type");
+  const requestUrl = req.url;
 
   const log = (level: "info" | "warn" | "error", msg: string, extra?: Record<string, unknown>) => {
     const payload = {
@@ -215,9 +221,13 @@ export async function POST(req: Request): Promise<Response> {
   };
 
   try {
+    const url = new URL(requestUrl);
+    const apiKey = url.searchParams.get("api_key") ?? "";
+
     log("info", "request_received", {
       method: req.method,
-      content_type: contentType ?? undefined
+      content_type: contentType ?? undefined,
+      url: redactUrlForLogs(requestUrl)
     });
 
     const { body: rawBody, rawText } = await readJsonBody(req);
@@ -230,10 +240,10 @@ export async function POST(req: Request): Promise<Response> {
       raw_text_preview: rawText && rawText.length > 0 ? rawText.slice(0, 500) : rawText
     });
 
-    if (!isNonEmptyString(body.api_key)) {
-      log("warn", "validation_failed_missing_api_key");
+    if (!isNonEmptyString(apiKey)) {
+      log("warn", "validation_failed_missing_api_key_query_param");
       return NextResponse.json(
-        { error: "Missing api_key (SerpApi key) in request body.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
+        { error: "Missing api_key (SerpApi key) in query string (?api_key=...)", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
         { status: 400 }
       );
     }
@@ -313,7 +323,7 @@ export async function POST(req: Request): Promise<Response> {
     while (collected.length < batchSize && pages < maxPages) {
       pages++;
       const { local_results, nextStart } = await serpMapsSearch({
-        apiKey: body.api_key,
+        apiKey,
         q: serpQuery,
         ll,
         start
