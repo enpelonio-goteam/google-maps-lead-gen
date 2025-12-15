@@ -64,6 +64,38 @@ type RequestBody = {
   existing_businesses: unknown; // array of objects (your Airtable-like rows)
 };
 
+function getRequestId() {
+  // crypto.randomUUID is available in the Node.js runtime used by Vercel.
+  // Fallback is extremely unlikely, but keeps local/polyfills happy.
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function redactBodyForLogs(body: unknown): unknown {
+  if (!body || typeof body !== "object") return body;
+  if (Array.isArray(body)) return `[array length=${body.length}]`;
+  const obj = body as Record<string, unknown>;
+  const copy: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.toLowerCase().includes("api_key") || k.toLowerCase() === "apikey") {
+      copy[k] = "[REDACTED]";
+      continue;
+    }
+    if (k === "existing_businesses" && Array.isArray(v)) {
+      copy[k] = `[array length=${v.length}]`;
+      continue;
+    }
+    copy[k] = v;
+  }
+  return copy;
+}
+
+function getBodyKeysForDebug(body: unknown): string[] {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return [];
+  return Object.keys(body as Record<string, unknown>);
+}
+
 function normalizeExistingPlaceIds(existing: unknown): Set<string> {
   const set = new Set<string>();
   if (!Array.isArray(existing)) return set;
@@ -93,6 +125,17 @@ async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
     throw new Error(`Request failed (${res.status}) ${url} ${text ? `- ${text}` : ""}`.trim());
   }
   return await res.json();
+}
+
+async function readJsonBody(req: Request): Promise<{ body: unknown; rawText: string | null }> {
+  // Read as text first so we can log/diagnose malformed JSON / wrong content-type.
+  const rawText = await req.text();
+  if (!rawText) return { body: null, rawText: "" };
+  try {
+    return { body: JSON.parse(rawText), rawText };
+  } catch {
+    return { body: null, rawText };
+  }
 }
 
 async function geocodeLocation(location: string): Promise<{ lat: number; lon: number; name?: string; type?: string }> {
@@ -153,31 +196,92 @@ async function serpMapsSearch(params: {
 }
 
 export async function POST(req: Request): Promise<Response> {
+  const requestId = getRequestId();
+  const startedAt = Date.now();
+  const vercelId = req.headers.get("x-vercel-id");
+  const contentType = req.headers.get("content-type");
+
+  const log = (level: "info" | "warn" | "error", msg: string, extra?: Record<string, unknown>) => {
+    const payload = {
+      request_id: requestId,
+      vercel_id: vercelId ?? undefined,
+      at_ms: Date.now(),
+      msg,
+      ...extra
+    };
+    if (level === "error") console.error("[/api/leads]", payload);
+    else if (level === "warn") console.warn("[/api/leads]", payload);
+    else console.log("[/api/leads]", payload);
+  };
+
   try {
-    const body = (await req.json()) as Partial<RequestBody>;
+    log("info", "request_received", {
+      method: req.method,
+      content_type: contentType ?? undefined
+    });
+
+    const { body: rawBody, rawText } = await readJsonBody(req);
+    const body = (rawBody ?? {}) as Partial<RequestBody>;
+
+    log("info", "request_body_parsed", {
+      body_keys: getBodyKeysForDebug(body),
+      body_redacted: redactBodyForLogs(body),
+      // Don't dump the whole raw body (could be huge). Keep a small preview for debugging.
+      raw_text_preview: rawText && rawText.length > 0 ? rawText.slice(0, 500) : rawText
+    });
 
     if (!isNonEmptyString(body.api_key)) {
-      return NextResponse.json({ error: "Missing api_key (SerpApi key) in request body." }, { status: 400 });
+      log("warn", "validation_failed_missing_api_key");
+      return NextResponse.json(
+        { error: "Missing api_key (SerpApi key) in request body.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
+        { status: 400 }
+      );
     }
     if (!isNonEmptyString(body.location)) {
-      return NextResponse.json({ error: "Missing location in request body." }, { status: 400 });
+      log("warn", "validation_failed_missing_location", { received_body_keys: getBodyKeysForDebug(body) });
+      return NextResponse.json(
+        { error: "Missing location in request body.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
+        { status: 400 }
+      );
     }
     if (!isNonEmptyString(body.business_type)) {
-      return NextResponse.json({ error: "Missing business_type in request body." }, { status: 400 });
+      log("warn", "validation_failed_missing_business_type", { received_body_keys: getBodyKeysForDebug(body) });
+      return NextResponse.json(
+        { error: "Missing business_type in request body.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
+        { status: 400 }
+      );
     }
     if (!isFiniteInt(body.batch_size) || body.batch_size <= 0) {
-      return NextResponse.json({ error: "batch_size must be a positive integer." }, { status: 400 });
+      log("warn", "validation_failed_invalid_batch_size", { batch_size: body.batch_size });
+      return NextResponse.json(
+        { error: "batch_size must be a positive integer.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
+        { status: 400 }
+      );
     }
     if (!isFiniteInt(body.batch_start_index) || body.batch_start_index < 0) {
-      return NextResponse.json({ error: "batch_start_index must be an integer >= 0." }, { status: 400 });
+      log("warn", "validation_failed_invalid_batch_start_index", { batch_start_index: body.batch_start_index });
+      return NextResponse.json(
+        { error: "batch_start_index must be an integer >= 0.", request_id: requestId, received_body_keys: getBodyKeysForDebug(body) },
+        { status: 400 }
+      );
     }
 
     const batchSize = body.batch_size;
     const batchStartIndex = body.batch_start_index;
     const existingPlaceIds = normalizeExistingPlaceIds(body.existing_businesses);
 
+    log("info", "validated_request", {
+      location: body.location,
+      business_type: body.business_type,
+      batch_size: batchSize,
+      batch_start_index: batchStartIndex,
+      existing_businesses_dedupe_set_size: existingPlaceIds.size
+    });
+
     const { lat, lon } = await geocodeLocation(body.location);
     const ll = `@${lat},${lon},14z`;
+
+    log("info", "geocode_success", { ll });
 
     // We need "results starting from batchStartIndex" even though SerpApi returns fixed 20/page.
     // Strategy:
@@ -197,11 +301,20 @@ export async function POST(req: Request): Promise<Response> {
     const maxPages = 25; // up to 500 results scanned
     let pages = 0;
 
+    const serpQuery = `${body.business_type} in ${body.location}`;
+    log("info", "serpapi_paging_begin", {
+      q: serpQuery,
+      ll,
+      first_page_start: firstPageStart,
+      offset_within_page: offsetWithinPage,
+      max_pages: maxPages
+    });
+
     while (collected.length < batchSize && pages < maxPages) {
       pages++;
       const { local_results, nextStart } = await serpMapsSearch({
         apiKey: body.api_key,
-        q: `${body.business_type} in ${body.location}`,
+        q: serpQuery,
         ll,
         start
       });
@@ -211,6 +324,7 @@ export async function POST(req: Request): Promise<Response> {
       const slice = isFirstPage ? local_results.slice(offsetWithinPage) : local_results;
       isFirstPage = false;
 
+      const before = collected.length;
       for (const item of slice) {
         const pid = typeof item?.place_id === "string" ? item.place_id : "";
         if (!pid) continue;
@@ -220,10 +334,27 @@ export async function POST(req: Request): Promise<Response> {
         collected.push(item);
         if (collected.length >= batchSize) break;
       }
+      const added = collected.length - before;
+
+      log("info", "serpapi_page_scanned", {
+        page: pages,
+        start,
+        returned_count: local_results.length,
+        considered_count: slice.length,
+        added_count: added,
+        collected_total: collected.length,
+        next_start: nextStart
+      });
 
       if (nextStart === null) break;
       start = nextStart;
     }
+
+    log("info", "request_success", {
+      pages_scanned: pages,
+      results_count: collected.length,
+      duration_ms: Date.now() - startedAt
+    });
 
     return NextResponse.json(
       {
@@ -243,7 +374,15 @@ export async function POST(req: Request): Promise<Response> {
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const stack = err instanceof Error ? err.stack : undefined;
+    console.error("[/api/leads]", {
+      request_id: requestId,
+      vercel_id: vercelId ?? undefined,
+      msg: "request_failed",
+      error: msg,
+      stack
+    });
+    return NextResponse.json({ error: msg, request_id: requestId }, { status: 500 });
   }
 }
 
