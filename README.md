@@ -4,6 +4,7 @@ Single unauthenticated API endpoint that:
 
 - Geocodes `location` via Nominatim (`https://nominatim.openstreetmap.org/search`)
 - Queries Google Maps via SerpApi Google Maps engine (`engine=google_maps`) and paginates using `start`
+- Uses a query string of the form: `"<business_type> in <location>"`
 - Returns **at most** `batch_size` businesses, deduplicated against your `existing_businesses` by `place_id`
 
 Docs: `https://serpapi.com/google-maps-api`

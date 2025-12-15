@@ -201,7 +201,7 @@ export async function POST(req: Request): Promise<Response> {
       pages++;
       const { local_results, nextStart } = await serpMapsSearch({
         apiKey: body.api_key,
-        q: body.business_type,
+        q: `${body.business_type} in ${body.location}`,
         ll,
         start
       });
